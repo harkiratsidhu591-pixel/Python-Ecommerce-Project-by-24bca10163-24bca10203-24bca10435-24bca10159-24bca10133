@@ -1,0 +1,130 @@
+"""E-commerce customer behaviour analysis using Python's standard library."""
+from __future__ import annotations
+import argparse, csv, math, random
+from collections import Counter, defaultdict
+from pathlib import Path
+
+FIELDS = ['transaction_id','customer_id','product_id','category','unit_price','rating','quantity']
+
+def load_rows(path):
+    with open(path, newline='', encoding='utf-8-sig') as f:
+        rows=list(csv.DictReader(f))
+    required=set(FIELDS)
+    if not rows or not required.issubset(rows[0]):
+        raise ValueError('CSV must contain: '+', '.join(FIELDS))
+    clean=[]
+    for n,row in enumerate(rows, start=2):
+        try:
+            clean.append({'transaction_id':row['transaction_id'].strip(),'customer_id':row['customer_id'].strip(),'product_id':row['product_id'].strip(),'category':row['category'].strip(),'unit_price':float(row['unit_price']),'rating':float(row['rating']),'quantity':float(row['quantity'])})
+        except (ValueError, TypeError):
+            raise ValueError(f'Invalid numeric value on CSV row {n}')
+    return clean
+
+def pearson(x,y):
+    n=len(x)
+    if n<2:return 0.0
+    mx=sum(x)/n; my=sum(y)/n
+    dx=[a-mx for a in x]; dy=[b-my for b in y]
+    den=math.sqrt(sum(a*a for a in dx)*sum(b*b for b in dy))
+    return sum(a*b for a,b in zip(dx,dy))/den if den else 0.0
+
+def correlations(rows):
+    result=[]
+    for feature in ['unit_price','rating','quantity']:
+        score=pearson([r[feature] for r in rows],[r['quantity'] for r in rows])
+        result.append((feature,score))
+    return result
+
+def customer_features(rows):
+    grouped=defaultdict(list)
+    for r in rows: grouped[r['customer_id']].append(r)
+    data=[]
+    for key,items in sorted(grouped.items()):
+        count=sum(x['quantity'] for x in items)
+        data.append({'customer_id':key,'avg_price':sum(x['unit_price'] for x in items)/len(items),'avg_rating':sum(x['rating'] for x in items)/len(items),'total_quantity':count,'order_lines':len(items)})
+    return data
+
+def kmeans(points,k=3,seed=24,max_iter=100):
+    if len(points)<k: k=len(points)
+    features=['avg_price','avg_rating','total_quantity']
+    means={f:sum(p[f] for p in points)/len(points) for f in features}
+    std={f:(sum((p[f]-means[f])**2 for p in points)/len(points))**.5 or 1 for f in features}
+    z=[[ (p[f]-means[f])/std[f] for f in features] for p in points]
+    rng=random.Random(seed); centers=[z[i][:] for i in rng.sample(range(len(z)),k)]
+    labels=[0]*len(z)
+    for _ in range(max_iter):
+        new=[min(range(k),key=lambda c:sum((v-centers[c][j])**2 for j,v in enumerate(row))) for row in z]
+        updated=[]
+        for c in range(k):
+            members=[z[i] for i,v in enumerate(new) if v==c]
+            updated.append([sum(row[j] for row in members)/len(members) if members else centers[c][j] for j in range(len(features))])
+        if new==labels and updated==centers: break
+        labels,centers=new,updated
+    return labels
+
+def apriori(rows,min_support=.08,min_confidence=.25):
+    baskets=defaultdict(set)
+    for r in rows:
+        if r['quantity']>0: baskets[r['transaction_id']].add(r['product_id'])
+    n=len(baskets)
+    if n==0:return []
+    threshold=max(1,math.ceil(min_support*n)); counts=Counter(x for basket in baskets.values() for x in basket)
+    freq={frozenset([item]):cnt for item,cnt in counts.items() if cnt>=threshold}
+    all_freq=dict(freq); k=2
+    while freq:
+        items=sorted({next(iter(s)) for s in freq if len(s)==1}) if k==2 else sorted({tuple(sorted(s)) for s in freq})
+        prev=set(freq); candidates=set()
+        prev_items=[tuple(sorted(s)) for s in prev]
+        for i,a in enumerate(prev_items):
+            for b in prev_items[i+1:]:
+                union=frozenset(a)|frozenset(b)
+                if len(union)==k and all(frozenset(sub) in prev for sub in __import__('itertools').combinations(union,k-1)):
+                    candidates.add(union)
+        next_freq={c:sum(c.issubset(b) for b in baskets.values()) for c in candidates}
+        freq={c:v for c,v in next_freq.items() if v>=threshold}; all_freq.update(freq); k+=1
+        if k>len({item for b in baskets.values() for item in b}):break
+    rules=[]
+    for itemset,support_count in all_freq.items():
+        if len(itemset)<2:continue
+        for item in itemset:
+            antecedent=itemset-{item}; ante_count=all_freq.get(antecedent,0)
+            if ante_count:
+                confidence=support_count/ante_count
+                if confidence>=min_confidence:
+                    consequent_count=counts[item]
+                    lift=confidence/(consequent_count/n)
+                    rules.append({'antecedent':', '.join(sorted(antecedent)),'consequent':item,'support':support_count/n,'confidence':confidence,'lift':lift})
+    return sorted(rules,key=lambda r:(-r['lift'],-r['support']))
+
+def write_csv(path,rows,fields):
+    with open(path,'w',newline='',encoding='utf-8') as f:
+        w=csv.DictWriter(f,fieldnames=fields); w.writeheader(); w.writerows(rows)
+
+def run(input_path,out_dir,k,min_support,min_confidence):
+    rows=load_rows(input_path); out_dir.mkdir(parents=True,exist_ok=True)
+    corrs=correlations(rows); write_csv(out_dir/'correlations.csv',[{'attribute':a,'pearson_r':f'{v:.4f}'} for a,v in corrs],['attribute','pearson_r'])
+    people=customer_features(rows); labels=kmeans(people,k)
+    clustered=[dict(p,cluster=labels[i]+1) for i,p in enumerate(people)]
+    write_csv(out_dir/'customer_clusters.csv',clustered,['customer_id','avg_price','avg_rating','total_quantity','order_lines','cluster'])
+    rules=apriori(rows,min_support,min_confidence); write_csv(out_dir/'association_rules.csv',rules,['antecedent','consequent','support','confidence','lift'])
+    summary=[f'E-commerce customer behaviour analysis',f'Input: {input_path}',f'Line items: {len(rows)}',f'Customers: {len(people)}',f'Apriori rules: {len(rules)}','', 'Pearson correlation with quantity:']
+    summary += [f'  {name}: {value:.4f}' for name,value in corrs]
+    summary += ['', 'Cluster sizes:']
+    summary += [f'  Cluster {c}: {sum(1 for v in labels if v==c)} customers' for c in range(max(labels,default=0)+1)]
+    summary += ['', 'Top association rules:']
+    summary += [f"  {r['antecedent']} -> {r['consequent']} (support={r['support']:.3f}, confidence={r['confidence']:.3f}, lift={r['lift']:.3f})" for r in rules[:10]]
+    (out_dir/'summary.txt').write_text('\n'.join(summary),encoding='utf-8')
+    print(f'Analysis complete. Results saved in: {out_dir.resolve()}')
+
+def main():
+    base=Path(__file__).resolve().parents[1]
+    parser=argparse.ArgumentParser(description='Analyze e-commerce behaviour with correlation, k-means and Apriori.')
+    parser.add_argument('--input',type=Path,default=base/'data'/'ecommerce_sample.csv')
+    parser.add_argument('--output',type=Path,default=base/'results')
+    parser.add_argument('--clusters',type=int,default=3)
+    parser.add_argument('--min-support',type=float,default=.08)
+    parser.add_argument('--min-confidence',type=float,default=.25)
+    args=parser.parse_args()
+    if args.clusters<1 or not 0<args.min_support<=1 or not 0<=args.min_confidence<=1: parser.error('clusters must be positive; support in (0,1], confidence in [0,1]')
+    run(args.input,args.output,args.clusters,args.min_support,args.min_confidence)
+if __name__=='__main__': main()
